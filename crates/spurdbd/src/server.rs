@@ -207,14 +207,25 @@ impl SlurmAccounting for AccountingService {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let entries = records
-            .iter()
-            .map(|r| UsageEntry {
-                user: r.user_name.clone(),
-                account: r.account.clone(),
-                cpu_hours: r.cpu_seconds as f64 / 3600.0,
-                gpu_hours: r.gpu_seconds as f64 / 3600.0,
-                job_count: r.job_count,
+        let mut agg: std::collections::HashMap<(String, String), (f64, f64, u64)> =
+            std::collections::HashMap::new();
+        for r in &records {
+            let e = agg
+                .entry((r.user_name.clone(), r.account.clone()))
+                .or_default();
+            e.0 += r.cpu_seconds as f64 / 3600.0;
+            e.1 += r.gpu_seconds as f64 / 3600.0;
+            e.2 += r.job_count;
+        }
+
+        let entries = agg
+            .into_iter()
+            .map(|((user, account), (cpu, gpu, jobs))| UsageEntry {
+                user,
+                account,
+                cpu_hours: cpu,
+                gpu_hours: gpu,
+                job_count: jobs,
             })
             .collect();
 
@@ -426,7 +437,7 @@ impl SlurmAccounting for AccountingService {
         let halflife_days = if req.halflife_days == 0 {
             14
         } else {
-            req.halflife_days
+            req.halflife_days.clamp(1, 365)
         };
 
         let now = Utc::now();

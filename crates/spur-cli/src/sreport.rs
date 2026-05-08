@@ -151,7 +151,7 @@ async fn report_account_utilization_by_user(
         }
     }
 
-    // Aggregate entries by account and (user, account)
+    // Build lookup maps (server guarantees one entry per user+account)
     let mut acct_agg: std::collections::HashMap<&str, (f64, f64, u64)> =
         std::collections::HashMap::new();
     let mut user_agg: std::collections::HashMap<(&str, &str), (f64, f64, u64)> =
@@ -161,10 +161,10 @@ async fn report_account_utilization_by_user(
         a.0 += e.cpu_hours;
         a.1 += e.gpu_hours;
         a.2 += e.job_count;
-        let u = user_agg.entry((&e.user, &e.account)).or_default();
-        u.0 += e.cpu_hours;
-        u.1 += e.gpu_hours;
-        u.2 += e.job_count;
+        user_agg.insert(
+            (&e.user, &e.account),
+            (e.cpu_hours, e.gpu_hours, e.job_count),
+        );
     }
 
     for account in &accounts {
@@ -255,10 +255,10 @@ async fn report_user_utilization_by_account(
     let mut user_agg: std::collections::HashMap<(&str, &str), (f64, f64, u64)> =
         std::collections::HashMap::new();
     for e in &usage.entries {
-        let u = user_agg.entry((&e.user, &e.account)).or_default();
-        u.0 += e.cpu_hours;
-        u.1 += e.gpu_hours;
-        u.2 += e.job_count;
+        user_agg.insert(
+            (&e.user, &e.account),
+            (e.cpu_hours, e.gpu_hours, e.job_count),
+        );
     }
 
     for user in &users {

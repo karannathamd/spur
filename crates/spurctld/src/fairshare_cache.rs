@@ -45,7 +45,7 @@ impl FairshareCache {
         refresh_interval_secs: u64,
     ) {
         let cache = Arc::clone(self);
-        let interval = Duration::from_secs(refresh_interval_secs);
+        let interval = Duration::from_secs(refresh_interval_secs.max(10));
 
         tokio::spawn(async move {
             let uri = if host.starts_with("http://") || host.starts_with("https://") {
@@ -72,13 +72,17 @@ impl FairshareCache {
             loop {
                 tokio::time::sleep(interval).await;
 
-                match Self::fetch(&uri, halflife_days).await {
-                    Ok(factors) => {
-                        cache.replace(factors);
+                match tokio::time::timeout(
+                    Duration::from_secs(10),
+                    Self::fetch(&uri, halflife_days),
+                )
+                .await
+                {
+                    Ok(Ok(factors)) => cache.replace(factors),
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "fairshare refresh failed, retaining stale data")
                     }
-                    Err(e) => {
-                        warn!(error = %e, "fairshare refresh failed, retaining stale data");
-                    }
+                    Err(_) => warn!("fairshare refresh timed out, retaining stale data"),
                 }
             }
         });

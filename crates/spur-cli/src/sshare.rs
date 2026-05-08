@@ -78,16 +78,14 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         total_shares
     };
 
-    // Aggregate usage entries by account and by (user, account)
+    // Build lookup maps from entries (server guarantees one entry per user+account)
     let mut account_cpu_hours: std::collections::HashMap<&str, f64> =
         std::collections::HashMap::new();
     let mut user_account_cpu_hours: std::collections::HashMap<(&str, &str), f64> =
         std::collections::HashMap::new();
     for entry in &usage.entries {
         *account_cpu_hours.entry(&entry.account).or_default() += entry.cpu_hours;
-        *user_account_cpu_hours
-            .entry((&entry.user, &entry.account))
-            .or_default() += entry.cpu_hours;
+        user_account_cpu_hours.insert((&entry.user, &entry.account), entry.cpu_hours);
     }
 
     // Compute total usage for normalization
