@@ -361,8 +361,10 @@ pub async fn get_usage(
 ) -> anyhow::Result<Vec<UsageRecord>> {
     let rows = sqlx::query(
         r#"
-        SELECT user_name, account, SUM(cpu_seconds) as total_cpu_seconds,
-               SUM(gpu_seconds) as total_gpu_seconds, SUM(job_count) as total_jobs,
+        SELECT user_name, account,
+               SUM(cpu_seconds)::BIGINT as total_cpu_seconds,
+               SUM(gpu_seconds)::BIGINT as total_gpu_seconds,
+               SUM(job_count)::BIGINT as total_jobs,
                period_start
         FROM usage
         WHERE period_start >= $1
