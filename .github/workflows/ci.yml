@@ -155,46 +155,132 @@ jobs:
     name: Build Docker Image
     runs-on: ubuntu-latest
     needs: [build-and-test, fmt, clippy]
+    outputs:
+      image_tag: ${{ steps.tag.outputs.value }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build container image
-        run: sg docker -c "docker build -f deploy/Dockerfile -t spur:ci ."
+      - name: Set image tag
+        id: tag
+        run: echo "value=${{ secrets.REGISTRY }}/spur:${{ github.sha }}" >> "$GITHUB_OUTPUT"
 
-      - name: Save image as artifact
-        run: sg docker -c "docker save spur:ci -o /tmp/spur-ci-image.tar"
-
-      - name: Upload image artifact
-        uses: actions/upload-artifact@v4
+      - name: Log in to registry
+        uses: docker/login-action@v3
         with:
-          name: spur-ci-image
-          path: /tmp/spur-ci-image.tar
-          retention-days: 1
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
 
-  k8s:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: true
+          tags: ${{ steps.tag.outputs.value }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  k8s-integration:
     name: K8s Integration
-    runs-on: [self-hosted, mi300x]
+    runs-on: [self-hosted, amd-aac02-rocm]
     needs: build-docker-image
     concurrency:
-      group: k8s-${{ github.ref }}
+      group: k8s-integration
       cancel-in-progress: true
+    env:
+      KUBECONFIG: /home/amd/.kube/config
+      SPUR_TEST_NS: spur-ci-${{ github.run_id }}
+      SPUR_CI_IMAGE: ${{ secrets.REGISTRY }}/spur:${{ github.sha }}
+      RUST_LOG: info
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download CI image
-        uses: actions/download-artifact@v4
-        with:
-          name: spur-ci-image
-          path: /tmp
+      - name: Select kubectl context
+        run: kubectl config use-context kubernetes-admin@kubernetes
 
-      - name: Load CI image
-        run: sg docker -c "docker load -i /tmp/spur-ci-image.tar"
+      - name: Remove leftover spur-ci namespaces
+        run: |
+          set -euo pipefail
+          leftover=$(kubectl get ns -o jsonpath='{.items[*].metadata.name}' \
+            | tr ' ' '\n' | grep '^spur-ci-' || true)
+          if [ -z "$leftover" ]; then
+            echo "No leftover spur-ci namespaces"
+            exit 0
+          fi
+          echo "Deleting leftover spur-ci namespaces (cluster-scoped operator/RBAC contention):"
+          echo "$leftover"
+          for ns in $leftover; do
+            kubectl delete ns "$ns" --ignore-not-found --wait=false
+          done
+          deadline=$((SECONDS + 120))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            remaining=$(kubectl get ns -o jsonpath='{.items[*].metadata.name}' \
+              | tr ' ' '\n' | grep '^spur-ci-' || true)
+            if [ -z "$remaining" ]; then
+              echo "All spur-ci namespaces removed"
+              exit 0
+            fi
+            echo "Waiting for namespaces to terminate: $remaining"
+            sleep 5
+          done
+          echo "ERROR: timed out after 2m waiting for spur-ci namespace deletion:"
+          kubectl get ns -o wide $(echo "$remaining" | tr '\n' ' ')
+          exit 1
+
+      - name: Clean cluster-scoped Spur RBAC (pre)
+        run: |
+          set -euo pipefail
+          kubectl delete clusterrolebinding spur-operator --ignore-not-found
+          kubectl delete clusterrole spur-operator --ignore-not-found
+
+      - name: Create test namespace
+        run: |
+          kubectl create namespace "$SPUR_TEST_NS" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Create registry pull secret
+        env:
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          kubectl create secret docker-registry regcred \
+            --docker-server="https://index.docker.io/v1/" \
+            --docker-username="$REGISTRY_USERNAME" \
+            --docker-password="$REGISTRY_PASSWORD" \
+            -n "$SPUR_TEST_NS" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl patch serviceaccount default -n "$SPUR_TEST_NS" \
+            -p '{"imagePullSecrets": [{"name": "regcred"}]}'
+
+      - name: Verify cluster can pull CI image
+        run: |
+          set -euo pipefail
+          kubectl run image-pull-check \
+            --namespace="$SPUR_TEST_NS" \
+            --image="$SPUR_CI_IMAGE" \
+            --restart=Never \
+            --command -- sleep 30
+          if ! kubectl wait --namespace="$SPUR_TEST_NS" \
+            --for=condition=Ready pod/image-pull-check --timeout=120s; then
+            echo "ERROR: cluster failed to pull $SPUR_CI_IMAGE"
+            kubectl describe pod image-pull-check -n "$SPUR_TEST_NS" || true
+            kubectl get events -n "$SPUR_TEST_NS" --sort-by='.lastTimestamp' | tail -30 || true
+            exit 1
+          fi
+          kubectl delete pod image-pull-check -n "$SPUR_TEST_NS" --ignore-not-found --wait=true
 
       - name: Run K8s integration tests
-        run: sg docker -c "SPUR_CI_IMAGE=spur:ci bash deploy/bare-metal/k8s_test.sh"
+        run: bash deploy/bare-metal/k8s_test.sh
 
-      - name: Cleanup kind cluster
+      - name: Cleanup test resources
         if: always()
         run: |
-          export PATH="$HOME/.local/bin:$PATH"
-          sg docker -c "kind delete cluster --name spur-ci" 2>/dev/null || true
+          set -euo pipefail
+          kubectl delete namespace "$SPUR_TEST_NS" --ignore-not-found --timeout=120s || true
+          kubectl delete clusterrolebinding spur-operator --ignore-not-found
+          kubectl delete clusterrole spur-operator --ignore-not-found
+          kubectl delete crd spurjobs.spur.ai --ignore-not-found --timeout=120s || true
