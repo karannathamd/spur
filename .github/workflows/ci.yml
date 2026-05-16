@@ -3,7 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
-  pull_request:
+  pull_request_target:
     branches: [main]
   workflow_dispatch:
 
@@ -15,6 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Install protobuf compiler
         run: sudo apt-get install -y protobuf-compiler
@@ -43,6 +45,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -53,6 +57,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Install protobuf compiler
         run: sudo apt-get install -y protobuf-compiler
@@ -81,10 +87,12 @@ jobs:
     needs: [build-and-test, fmt, clippy]
     # Only one cluster run at a time; cancel older runs on the same ref.
     concurrency:
-      group: cluster-${{ github.ref }}
+      group: cluster-${{ github.head_ref || github.ref }}
       cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Build release binaries
         run: |
@@ -159,6 +167,8 @@ jobs:
       image_tag: ${{ steps.tag.outputs.value }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Set image tag
         id: tag
@@ -197,6 +207,8 @@ jobs:
       RUST_LOG: info
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Select kubectl context
         run: kubectl config use-context kubernetes-admin@kubernetes
