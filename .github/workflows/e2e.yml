@@ -99,7 +99,7 @@ jobs:
           RUST_LOG: info
         run: |
           chmod +x /tmp/e2e-bin/spur-k8s-tests
-          /tmp/e2e-bin/spur-k8s-tests bare_metal::single_node -- --ignored --test-threads=1
+          /tmp/e2e-bin/spur-k8s-tests bare_metal::single_node --ignored --test-threads=1
 
       - name: Run multi-node bare-metal tests
         env:
@@ -109,7 +109,7 @@ jobs:
           SPUR_TEST_BM_DEPLOY_DIR: trusted-repo/deploy/bare-metal
           SPUR_TEST_BM_REMOTE_DIR: ${{ env.BM_REMOTE_BASE }}/multi-node
           RUST_LOG: info
-        run: /tmp/e2e-bin/spur-k8s-tests bare_metal::multi_node -- --ignored --test-threads=1
+        run: /tmp/e2e-bin/spur-k8s-tests bare_metal::multi_node --ignored --test-threads=1
 
       - name: Run single-node GPU bare-metal tests
         env:
@@ -119,7 +119,7 @@ jobs:
           SPUR_TEST_BM_DEPLOY_DIR: trusted-repo/deploy/bare-metal
           SPUR_TEST_BM_REMOTE_DIR: ${{ env.BM_REMOTE_BASE }}/gpu-single-node
           RUST_LOG: info
-        run: /tmp/e2e-bin/spur-k8s-tests bare_metal::gpu::single_node -- --ignored --test-threads=1
+        run: /tmp/e2e-bin/spur-k8s-tests bare_metal::gpu::single_node --ignored --test-threads=1
 
       - name: Run multi-node GPU bare-metal tests
         env:
@@ -129,7 +129,7 @@ jobs:
           SPUR_TEST_BM_DEPLOY_DIR: trusted-repo/deploy/bare-metal
           SPUR_TEST_BM_REMOTE_DIR: ${{ env.BM_REMOTE_BASE }}/gpu-multi-node
           RUST_LOG: info
-        run: /tmp/e2e-bin/spur-k8s-tests bare_metal::gpu::multi_node -- --ignored --test-threads=1
+        run: /tmp/e2e-bin/spur-k8s-tests bare_metal::gpu::multi_node --ignored --test-threads=1
 
       - name: Collect cluster logs
         if: always()
