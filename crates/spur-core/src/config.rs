@@ -79,6 +79,10 @@ pub struct SlurmConfig {
     /// Auto-update configuration.
     #[serde(default)]
     pub update: UpdateConfig,
+
+    /// OpenMetrics HTTP export (spurctld, default port 6822).
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 }
 
 /// Configuration for auto-update checking and self-update.
@@ -117,6 +121,94 @@ impl Default for UpdateConfig {
             channel: "stable".into(),
             cache_dir: "/var/cache/spur".into(),
         }
+    }
+}
+
+/// OpenMetrics export settings for spurctld (separate listener from gRPC 6817).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetricsConfig {
+    /// When false, spurctld does not start the metrics HTTP server.
+    #[serde(default = "default_true_fn")]
+    pub enabled: bool,
+    /// Metrics HTTP listen address (port used when `bind = "loopback"`).
+    #[serde(default = "default_metrics_listen_addr")]
+    pub listen_addr: String,
+    /// `loopback` binds 127.0.0.1; `all` uses `listen_addr` as-is.
+    #[serde(default)]
+    pub bind: MetricsBind,
+    /// Reserved for `/metrics/jobs-users-accts` (high cardinality; off by default).
+    /// Route exists but returns 404 until a follow-up PR implements the exporter.
+    #[serde(default)]
+    pub high_cardinality: bool,
+    /// Text exposition wire format for `/metrics/*` responses.
+    #[serde(default)]
+    pub exposition_format: MetricsExpositionFormat,
+}
+
+fn default_metrics_listen_addr() -> String {
+    "[::]:6822".into()
+}
+
+/// Metrics HTTP text exposition format (Slurm 0.0.4 default vs OpenMetrics 1.0 strict).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[allow(non_camel_case_types)]
+pub enum MetricsExpositionFormat {
+    /// Prometheus text exposition 0.0.4 (Slurm 25.11–compatible; no `# EOF`).
+    #[default]
+    #[serde(rename = "slurm_0_0_4")]
+    Slurm_0_0_4,
+    /// OpenMetrics 1.0 strict text (`# EOF` required).
+    #[serde(rename = "openmetrics_1_0")]
+    OpenMetrics_1_0,
+}
+
+impl MetricsExpositionFormat {
+    /// HTTP `Content-Type` for this format.
+    pub fn content_type(self) -> &'static str {
+        match self {
+            Self::Slurm_0_0_4 => "text/plain; version=0.0.4; charset=utf-8",
+            Self::OpenMetrics_1_0 => "application/openmetrics-text; version=1.0.0; charset=utf-8",
+        }
+    }
+}
+
+/// Metrics HTTP bind policy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricsBind {
+    #[default]
+    Loopback,
+    All,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            listen_addr: default_metrics_listen_addr(),
+            bind: MetricsBind::Loopback,
+            high_cardinality: false,
+            exposition_format: MetricsExpositionFormat::default(),
+        }
+    }
+}
+
+impl MetricsConfig {
+    /// Listen socket after applying [`MetricsBind`].
+    ///
+    /// Returns an error if `listen_addr` is not a valid `SocketAddr`.
+    pub fn effective_listen_addr(&self) -> Result<std::net::SocketAddr, ConfigError> {
+        let addr = self
+            .listen_addr
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| ConfigError::InvalidValue {
+                field: "metrics.listen_addr".into(),
+                value: e.to_string(),
+            })?;
+        Ok(match self.bind {
+            MetricsBind::All => addr,
+            MetricsBind::Loopback => std::net::SocketAddr::from(([127, 0, 0, 1], addr.port())),
+        })
     }
 }
 
@@ -728,6 +820,83 @@ mod tests {
         assert_eq!(format_time(Some(90)), "01:30:00");
         assert_eq!(format_time(Some(1500)), "1-01:00:00");
         assert_eq!(format_time(None), "UNLIMITED");
+    }
+
+    #[test]
+    fn test_load_metrics_config() {
+        let toml = r#"
+cluster_name = "test"
+
+[metrics]
+enabled = false
+listen_addr = "[::]:9999"
+bind = "all"
+high_cardinality = true
+exposition_format = "openmetrics_1_0"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert!(!config.metrics.enabled);
+        assert_eq!(config.metrics.listen_addr, "[::]:9999");
+        assert_eq!(config.metrics.bind, MetricsBind::All);
+        assert!(config.metrics.high_cardinality);
+        assert_eq!(
+            config.metrics.exposition_format,
+            MetricsExpositionFormat::OpenMetrics_1_0
+        );
+        assert_eq!(
+            config.metrics.effective_listen_addr().unwrap(),
+            "[::]:9999".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_metrics_defaults() {
+        let config = SlurmConfig::load_from_str(r#"cluster_name = "x""#).unwrap();
+        assert!(config.metrics.enabled);
+        assert_eq!(config.metrics.listen_addr, "[::]:6822");
+        assert_eq!(config.metrics.bind, MetricsBind::Loopback);
+        assert!(!config.metrics.high_cardinality);
+        assert_eq!(
+            config.metrics.exposition_format,
+            MetricsExpositionFormat::Slurm_0_0_4
+        );
+        assert_eq!(
+            config.metrics.exposition_format.content_type(),
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        assert_eq!(
+            config.metrics.effective_listen_addr().unwrap(),
+            "127.0.0.1:6822".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_metrics_exposition_format_serde() {
+        let toml = r#"
+cluster_name = "x"
+
+[metrics]
+exposition_format = "slurm_0_0_4"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(
+            config.metrics.exposition_format,
+            MetricsExpositionFormat::Slurm_0_0_4
+        );
+    }
+
+    #[test]
+    fn test_metrics_invalid_listen_addr() {
+        let config = SlurmConfig::load_from_str(
+            r#"
+cluster_name = "x"
+
+[metrics]
+listen_addr = "not-a-socket"
+"#,
+        )
+        .unwrap();
+        assert!(config.metrics.effective_listen_addr().is_err());
     }
 
     #[test]
