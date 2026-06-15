@@ -18,7 +18,7 @@ use spur_core::partition::Partition;
 use spur_core::qos::{check_qos_limits, QosCheckResult};
 use spur_core::reservation::Reservation;
 use spur_core::resource::{ResourceAllocations, ResourceSet};
-use spur_core::step::{JobStep, StepState, STEP_BATCH};
+use spur_core::step::{JobStep, StepState, STEP_BATCH, STEP_RESERVED_MIN};
 use spur_core::wal::WalOperation;
 use spur_metrics::job::JobMetricsSnapshot;
 use spur_metrics::node::NodeMetricsSnapshot;
@@ -488,6 +488,7 @@ impl ClusterManager {
         job_id: JobId,
         node_name: &str,
         exit_code: i32,
+        signal: i32,
     ) -> Result<NodeCompleteResult, NodeCompleteError> {
         {
             let jobs = self.jobs.read();
@@ -510,6 +511,7 @@ impl ClusterManager {
                 job_id,
                 node_name: node_name.to_string(),
                 exit_code,
+                signal,
             })
             .map_err(|source| NodeCompleteError::RaftPropose { source })?;
 
@@ -1099,6 +1101,23 @@ impl ClusterManager {
     pub fn create_step(&self, job_id: JobId, step_id: u32, step: JobStep) {
         self.steps.write().insert((job_id, step_id), step);
         debug!(job_id, step_id, "step created");
+    }
+
+    /// Record an srun step's completion via Raft so the step exit code and the
+    /// job's running-max DerivedExitCode are durable and replay-consistent.
+    #[allow(clippy::result_large_err)]
+    pub fn record_step_complete(
+        &self,
+        job_id: JobId,
+        step_id: u32,
+        exit_code: i32,
+    ) -> anyhow::Result<()> {
+        self.propose(WalOperation::JobStepComplete {
+            job_id,
+            step_id,
+            exit_code,
+        })?;
+        Ok(())
     }
 
     /// Get all steps for a job.
@@ -1822,6 +1841,7 @@ impl ClusterManager {
                 job_id,
                 node_name,
                 exit_code,
+                signal,
             } => {
                 let finalized = {
                     let Some(job) = jobs.get_mut(job_id) else {
@@ -1832,7 +1852,13 @@ impl ClusterManager {
                     }
 
                     let already_reported = job.node_completions.contains_key(node_name);
-                    job.node_completions.insert(node_name.clone(), *exit_code);
+                    job.node_completions.insert(
+                        node_name.clone(),
+                        spur_core::job::NodeCompletion {
+                            code: *exit_code,
+                            signal: *signal,
+                        },
+                    );
 
                     if let Some(ref total) = job.allocated_resources {
                         if !already_reported {
@@ -1865,11 +1891,27 @@ impl ClusterManager {
                     }
 
                     if job.all_nodes_completed() {
-                        let (final_state, final_exit) =
-                            Job::derived_completion(&job.node_completions);
+                        // Primary = batch node (allocated_nodes[0]); empty when
+                        // none allocated, where derived_completion falls back to
+                        // the worst completion.
+                        let primary = job.allocated_nodes.first().cloned().unwrap_or_default();
+                        let (final_state, final_exit, final_signal) =
+                            Job::derived_completion(&job.node_completions, &primary);
                         match job.transition(final_state) {
                             Ok(()) => {
                                 job.exit_code = Some(final_exit);
+                                job.exit_signal = final_signal;
+                                // DerivedExitCode is the running max over srun
+                                // steps, accumulated live by JobStepComplete; a
+                                // job with no srun steps keeps 0 (Slurm parity),
+                                // not the batch exit. Left as-is here.
+                                job.pending_reason = if final_signal != 0 {
+                                    PendingReason::RaisedSignal
+                                } else if final_exit != 0 {
+                                    PendingReason::NonZeroExitCode
+                                } else {
+                                    PendingReason::None
+                                };
                                 job.end_time = Some(timestamp);
                                 job.node_completions.clear();
                                 Some((final_state, final_exit))
@@ -1971,6 +2013,34 @@ impl ClusterManager {
                 drop(jobs);
                 drop(nodes);
                 self.complete_job_steps_and_licenses(job_id, *exit_code, timestamp);
+            }
+            WalOperation::JobStepComplete {
+                job_id,
+                step_id,
+                exit_code,
+            } => {
+                // Record the step's own exit code/state.
+                {
+                    let mut steps = self.steps.write();
+                    if let Some(step) = steps.get_mut(&(*job_id, *step_id)) {
+                        step.state = if *exit_code == 0 {
+                            StepState::Completed
+                        } else {
+                            StepState::Failed
+                        };
+                        step.exit_code = Some(*exit_code);
+                        step.end_time = Some(timestamp);
+                    }
+                }
+                // DerivedExitCode is the running max over srun steps (the batch
+                // step is excluded — it carries the job's own exit, not a step
+                // result). Maintained live so `scontrol show job` reflects it
+                // mid-run, matching Slurm.
+                if *step_id < STEP_RESERVED_MIN {
+                    if let Some(job) = jobs.get_mut(job_id) {
+                        job.derived_exit_code = job.derived_exit_code.max(*exit_code);
+                    }
+                }
             }
             WalOperation::JobPriorityChange {
                 job_id,
@@ -2801,6 +2871,7 @@ mod tests {
             job_id: 1,
             node_name: "worker1".into(),
             exit_code: 0,
+            signal: 0,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -2840,6 +2911,7 @@ mod tests {
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
+            signal: 0,
         });
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Completing);
@@ -2851,6 +2923,7 @@ mod tests {
             job_id: 1,
             node_name: "n2".into(),
             exit_code: 0,
+            signal: 0,
         });
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
 
@@ -2858,14 +2931,105 @@ mod tests {
             job_id: 1,
             node_name: "n3".into(),
             exit_code: 42,
+            signal: 0,
         });
 
         let job = cm.get_job(1).unwrap();
-        assert_eq!(job.state, JobState::Failed);
-        assert_eq!(job.exit_code, Some(42));
+        // ExitCode follows the primary (batch) node n1 = allocated_nodes[0],
+        // which exited 0 — so the job state/exit_code reflect a clean primary.
+        assert_eq!(job.state, JobState::Completed);
+        assert_eq!(job.exit_code, Some(0));
+        // DerivedExitCode is the max over srun *steps* (Slurm parity), not node
+        // completions. This job ran no srun steps, so it is 0 — the non-primary
+        // node's exit 42 does not surface here.
+        assert_eq!(job.derived_exit_code, 0);
         for name in ["n1", "n2", "n3"] {
             assert_eq!(cm.get_node(name).unwrap().alloc_resources.cpus, 0);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn step_complete_accumulates_derived_exit_code_running_max() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("steps")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: scalar_alloc(4, 8000),
+            per_node_alloc: per_node_for(&["n1"], scalar_alloc(4, 8000)),
+        });
+
+        // Three srun steps exit 7, 3, 2 (in that order). DerivedExitCode tracks
+        // the running max live; ExitCode is unaffected (it is the batch exit).
+        cm.apply_operation(&WalOperation::JobStepComplete {
+            job_id: 1,
+            step_id: 0,
+            exit_code: 7,
+        });
+        assert_eq!(cm.get_job(1).unwrap().derived_exit_code, 7);
+        cm.apply_operation(&WalOperation::JobStepComplete {
+            job_id: 1,
+            step_id: 1,
+            exit_code: 3,
+        });
+        // 3 < 7, running max stays 7.
+        assert_eq!(cm.get_job(1).unwrap().derived_exit_code, 7);
+        cm.apply_operation(&WalOperation::JobStepComplete {
+            job_id: 1,
+            step_id: 2,
+            exit_code: 2,
+        });
+        assert_eq!(cm.get_job(1).unwrap().derived_exit_code, 7);
+
+        // Batch script exits 2 -> ExitCode=2:0, DerivedExitCode preserved at 7.
+        cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id: 1,
+            node_name: "n1".into(),
+            exit_code: 2,
+            signal: 0,
+        });
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(job.exit_code, Some(2));
+        assert_eq!(job.derived_exit_code, 7);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn step_complete_batch_step_excluded_from_derived() {
+        // The reserved batch step carries the job's own exit, not a step result,
+        // so it must NOT contribute to DerivedExitCode.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("batch-only")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+
+        cm.apply_operation(&WalOperation::JobStepComplete {
+            job_id: 1,
+            step_id: STEP_BATCH,
+            exit_code: 9,
+        });
+        // Reserved step id -> derived untouched.
+        assert_eq!(cm.get_job(1).unwrap().derived_exit_code, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2898,6 +3062,7 @@ mod tests {
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
+            signal: 0,
         });
         assert!(r1.job_finalized.is_none());
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
@@ -2906,6 +3071,7 @@ mod tests {
             job_id: 1,
             node_name: "n2".into(),
             exit_code: 0,
+            signal: 0,
         });
         let f = r2.job_finalized.expect("last node should finalize");
         assert_eq!(f.job_id, 1);
@@ -3028,11 +3194,119 @@ mod tests {
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
+            signal: 0,
         });
 
-        let result = cm.node_complete(1, "n2", 0).unwrap();
+        let result = cm.node_complete(1, "n2", 0, 0).unwrap();
         assert_eq!(result, NodeCompleteResult::Completing);
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_complete_sets_signal_reason_and_derived() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("signal-job")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: scalar_alloc(6, 12000),
+            per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
+        });
+
+        cm.node_complete(1, "n1", 0, 9).unwrap();
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(job.exit_code, Some(0));
+        assert_eq!(job.exit_signal, 9);
+        assert_eq!(job.derived_exit_code, 0);
+        assert_eq!(job.pending_reason, PendingReason::RaisedSignal);
+    }
+
+    // Reproduces the two steps report_job_status performs (validate the wire
+    // report, then node_complete) since ControllerService can't be built here.
+    // A signaled job's report (Completed, exit_code=0, signal=9) must be accepted
+    // and rederived to Failed / exit_signal=9 / RaisedSignal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_path_signaled_completion_accepted_and_rederived_failed() {
+        // Step 1: validate the wire report (Completed, exit_code=0) — must pass.
+        JobState::validate_completion_report_state(JobState::Completed, 0)
+            .expect("agent (Completed, exit_code=0) signaled report must pass RPC validation");
+
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("rpc-signal-job")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: scalar_alloc(6, 12000),
+            per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
+        });
+
+        // Step 2: the call the RPC makes after validation (wire state dropped).
+        cm.node_complete(1, "n1", 0, 9).unwrap();
+
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(job.exit_code, Some(0));
+        assert_eq!(job.exit_signal, 9);
+        assert_eq!(job.pending_reason, PendingReason::RaisedSignal);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_complete_sets_nonzero_exit_reason() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("exit-job")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: scalar_alloc(6, 12000),
+            per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
+        });
+
+        cm.node_complete(1, "n1", 42, 0).unwrap();
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(job.exit_code, Some(42));
+        assert_eq!(job.exit_signal, 0);
+        // No srun steps ran, so DerivedExitCode is 0 (Slurm parity) — the batch
+        // exit (42) surfaces as ExitCode, not DerivedExitCode.
+        assert_eq!(job.derived_exit_code, 0);
+        assert_eq!(job.pending_reason, PendingReason::NonZeroExitCode);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3065,6 +3339,7 @@ mod tests {
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
+            signal: 0,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -3092,6 +3367,7 @@ mod tests {
             job_id: 1,
             node_name: "n2".into(),
             exit_code: 0,
+            signal: 0,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -3127,12 +3403,13 @@ mod tests {
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
+            signal: 0,
         });
 
         cm.cancel_job(1, "testuser").unwrap();
         settle(&cm, 1, JobState::Cancelled);
 
-        let result = cm.node_complete(1, "n2", 0).unwrap();
+        let result = cm.node_complete(1, "n2", 0, 0).unwrap();
         assert_eq!(result, NodeCompleteResult::AlreadyTerminal);
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Cancelled);
     }

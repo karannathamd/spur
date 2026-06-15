@@ -7,6 +7,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 
+use crate::exit_fmt::{format_exit, render_reason};
+
 /// Administrative control commands.
 #[derive(Parser, Debug)]
 #[command(name = "scontrol", about = "Administrative control for Spur")]
@@ -257,7 +259,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 println!(
                     "   JobState={} Reason={}",
                     state_name(job.state),
-                    job.state_reason
+                    render_reason(&job.state_reason, job.exit_signal),
                 );
                 println!(
                     "   NumNodes={} NumTasks={} CPUs/Task={}",
@@ -274,7 +276,12 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 );
                 println!("   WorkDir={}", job.work_dir);
                 println!("   StdOut={} StdErr={}", job.stdout_path, job.stderr_path);
-                println!("   ExitCode={} Priority={}", job.exit_code, job.priority);
+                println!(
+                    "   ExitCode={} DerivedExitCode={} Priority={}",
+                    format_exit(job.exit_code, job.exit_signal),
+                    format_exit(job.derived_exit_code, 0),
+                    job.priority
+                );
                 println!();
             }
         }

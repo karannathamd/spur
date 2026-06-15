@@ -43,6 +43,14 @@ pub enum WalOperation {
         job_id: JobId,
         node_name: String,
         exit_code: i32,
+        signal: i32,
+    },
+    /// An srun job step finished. Records the step's exit code durably so the
+    /// job's DerivedExitCode (running max over steps) survives restart/replay.
+    JobStepComplete {
+        job_id: JobId,
+        step_id: u32,
+        exit_code: i32,
     },
     JobPriorityChange {
         job_id: JobId,
@@ -85,4 +93,36 @@ pub enum WalOperation {
         set: HashMap<String, String>,
         remove: Vec<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn job_node_complete_signal_round_trips() {
+        let op = WalOperation::JobNodeComplete {
+            job_id: 1,
+            node_name: "n0".into(),
+            exit_code: 0,
+            signal: 9,
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        // WalOperation has no PartialEq, so assert the fields rather than the value.
+        match back {
+            WalOperation::JobNodeComplete {
+                job_id,
+                node_name,
+                exit_code,
+                signal,
+            } => {
+                assert_eq!(job_id, 1);
+                assert_eq!(node_name, "n0");
+                assert_eq!(exit_code, 0);
+                assert_eq!(signal, 9);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
 }
