@@ -3579,6 +3579,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tonic",
+ "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
 ]
@@ -3626,26 +3627,6 @@ dependencies = [
  "sqlx",
  "tokio",
  "tonic",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "spurrestd"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "prost-types",
- "serde",
- "serde_json",
- "spur-core",
- "spur-proto",
- "tokio",
- "tonic",
- "tower",
- "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
 ]
