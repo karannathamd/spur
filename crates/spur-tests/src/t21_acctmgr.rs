@@ -181,9 +181,10 @@ mod tests {
             },
         );
         let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new());
+        // QOS wall-clock cap uses the QOS-specific reason, not PartitionTimeLimit.
         assert_eq!(
             result,
-            QosCheckResult::Blocked(PendingReason::PartitionTimeLimit)
+            QosCheckResult::Blocked(PendingReason::QosMaxWallDurationPerJobLimit)
         );
     }
 
@@ -210,7 +211,11 @@ mod tests {
             },
         );
         let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new());
-        assert_eq!(result, QosCheckResult::Blocked(PendingReason::Resources));
+        // QOS MaxTRES (CPU) cap uses the specific QOS reason, not generic Resources.
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosMaxCpuPerJobLimit)
+        );
     }
 
     // ── T21.14: QOS priority adjustment ──────────────────────────

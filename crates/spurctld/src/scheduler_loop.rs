@@ -97,6 +97,11 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // out of this cycle instead of sitting PENDING forever.
         cluster.cancel_unsatisfiable_dependency_jobs();
 
+        // Tag jobs pending_jobs() will drop (QoS/license/reservation) with their
+        // real reason, since they never reach update_pending_reasons(). Before the
+        // empty-check so reasons stay fresh even with nothing schedulable.
+        cluster.tag_blocked_pending_reasons();
+
         let pending = cluster.pending_jobs();
         if pending.is_empty() {
             continue;

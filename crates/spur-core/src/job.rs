@@ -231,6 +231,18 @@ pub enum PendingReason {
     InvalidQOS,
     BootFail,
     OutOfMemory,
+
+    // Slurm 25.11 reason-code parity additions; each maps to a WAIT_*/FAIL_*
+    // reason, with the byte-exact Slurm string in display(). Only reasons with
+    // a live emission path are landed here; the rest are added alongside their
+    // enforcement logic (see #307) to avoid dead variants accreting in the
+    // Raft-snapshot deserialization contract.
+    Reservation,
+    QosMaxCpuPerJobLimit,
+    QosMaxWallDurationPerJobLimit,
+    QosMaxMemoryPerJob,
+    QosMaxCpuPerUserLimit,
+    QosMaxSubmitJobPerUserLimit,
 }
 
 impl PendingReason {
@@ -261,6 +273,12 @@ impl PendingReason {
             Self::InvalidQOS => "InvalidQOS",
             Self::BootFail => "BootFailure",
             Self::OutOfMemory => "OutOfMemory",
+            Self::Reservation => "Reservation",
+            Self::QosMaxCpuPerJobLimit => "QOSMaxCpuPerJobLimit",
+            Self::QosMaxWallDurationPerJobLimit => "QOSMaxWallDurationPerJobLimit",
+            Self::QosMaxMemoryPerJob => "QOSMaxMemoryPerJob",
+            Self::QosMaxCpuPerUserLimit => "QOSMaxCpuPerUserLimit",
+            Self::QosMaxSubmitJobPerUserLimit => "QOSMaxSubmitJobPerUserLimit",
         }
     }
 }
@@ -1099,6 +1117,42 @@ mod tests {
         // Slurm reports this exact string ("DeadLine", note the cap D and L).
         // squeue scrapers and Slurm-compat clients pattern-match on it.
         assert_eq!(PendingReason::DeadLine.display(), "DeadLine");
+    }
+
+    /// (variant, exact Slurm 25.11.6 string) for every parity addition.
+    const REASON_VOCAB: &[(PendingReason, &str)] = &[
+        (PendingReason::Reservation, "Reservation"),
+        (PendingReason::QosMaxCpuPerJobLimit, "QOSMaxCpuPerJobLimit"),
+        (
+            PendingReason::QosMaxWallDurationPerJobLimit,
+            "QOSMaxWallDurationPerJobLimit",
+        ),
+        (PendingReason::QosMaxMemoryPerJob, "QOSMaxMemoryPerJob"),
+        (
+            PendingReason::QosMaxCpuPerUserLimit,
+            "QOSMaxCpuPerUserLimit",
+        ),
+        (
+            PendingReason::QosMaxSubmitJobPerUserLimit,
+            "QOSMaxSubmitJobPerUserLimit",
+        ),
+    ];
+
+    #[test]
+    fn reason_vocab_display_matches_slurm_25_11() {
+        for (reason, expected) in REASON_VOCAB {
+            assert_eq!(reason.display(), *expected, "Display for {reason:?}");
+            assert_eq!(format!("{reason}"), *expected, "fmt for {reason:?}");
+        }
+    }
+
+    #[test]
+    fn reason_vocab_serde_roundtrips() {
+        for (reason, _) in REASON_VOCAB {
+            let json = serde_json::to_string(reason).expect("serialize reason");
+            let back: PendingReason = serde_json::from_str(&json).expect("deserialize reason");
+            assert_eq!(&back, reason, "serde roundtrip for {reason:?}");
+        }
     }
 
     #[test]

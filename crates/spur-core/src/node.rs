@@ -130,6 +130,13 @@ impl NodeState {
         matches!(self, Self::Idle | Self::Mixed)
     }
 
+    /// Operationally up: `Idle`/`Mixed`/`Allocated`. Broader than [`is_available`]
+    /// because a fully-busy `Allocated` node is still up (a `Resources` wait, not
+    /// `NodeDown`); admin/system-down states are not up.
+    pub fn is_up(&self) -> bool {
+        matches!(self, Self::Idle | Self::Mixed | Self::Allocated)
+    }
+
     /// Every core variant, in proto discriminant order for iteration only.
     /// Wire conversion uses [`from_proto`](Self::from_proto) / [`to_proto`](Self::to_proto), not array index.
     pub const ALL: [NodeState; 9] = [

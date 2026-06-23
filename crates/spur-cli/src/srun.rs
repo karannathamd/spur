@@ -187,10 +187,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     if let Some(gpus) = &args.gpus {
         gres.push(format!("gpu:{}", gpus));
     }
-    // Append licenses as GRES entries (license:<name>:<count>)
-    for lic in &args.licenses {
-        gres.push(format!("license:{}", lic));
-    }
+    // Don't push licenses into gres here — proto_to_job_spec already folds them in.
 
     let time_limit = args
         .time
