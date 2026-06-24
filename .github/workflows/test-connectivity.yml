@@ -1,0 +1,25 @@
+name: Test connectivity
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test JIRA HTTPS connectivity
+        run: |
+          JIRA_HOST="pensando.atlassian.net"
+
+          echo "=== DNS lookup ==="
+          nslookup "${JIRA_HOST}" || echo "DNS: FAILED"
+
+          echo ""
+          echo "=== TCP connect (port 443, 5s timeout) ==="
+          timeout 5 bash -c "echo > /dev/tcp/${JIRA_HOST}/443" 2>&1 && echo "TCP: OK" || echo "TCP: FAILED"
+
+          echo ""
+          echo "=== HTTP response ==="
+          curl -sS --connect-timeout 5 --max-time 10 -o /dev/null \
+            -w "HTTP status: %{http_code}\nTime: %{time_total}s\nRemote IP: %{remote_ip}\n" \
+            "https://${JIRA_HOST}/rest/api/2/serverInfo" || echo "HTTP: FAILED"
