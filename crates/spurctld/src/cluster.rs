@@ -26,6 +26,7 @@ use spur_metrics::node::NodeMetricsSnapshot;
 
 use crate::accounting::AccountingNotifier;
 use crate::fairshare_cache::FairshareCache;
+use crate::limits_cache::QosCache;
 use crate::raft::{ClientResponse, JobFinalized, SpurRaft, StateMachineApply};
 
 /// Result of recording a per-node completion report.
@@ -59,6 +60,7 @@ pub struct ClusterManager {
     raft: RwLock<Option<SpurRaft>>,
     accounting: RwLock<Option<AccountingNotifier>>,
     fairshare_cache: Arc<FairshareCache>,
+    qos_cache: Arc<QosCache>,
     /// Wake signal for the scheduler loop.
     pub(crate) scheduler_notify: Arc<Notify>,
 }
@@ -68,6 +70,7 @@ impl ClusterManager {
         let partitions = config.build_partitions();
         let license_pool = config.licenses.clone();
         let fairshare_cache = Arc::new(FairshareCache::new());
+        let qos_cache = Arc::new(QosCache::new());
 
         let cm = Self {
             config,
@@ -82,6 +85,7 @@ impl ClusterManager {
             raft: RwLock::new(None),
             accounting: RwLock::new(None),
             fairshare_cache,
+            qos_cache,
             scheduler_notify: Arc::new(Notify::new()),
         };
 
@@ -1221,7 +1225,7 @@ impl ClusterManager {
         // QoS enforcement: check per-user limits for jobs with a QoS. Shares
         // the eligibility logic with tag_blocked_pending_reasons() via
         // qos_block_for() so the drop decision and the displayed reason agree.
-        pending.retain(|job| qos_block_for(job, &jobs).is_none());
+        pending.retain(|job| qos_block_for(job, &self.resolve_qos(job), &jobs).is_none());
 
         // License enforcement is applied after the priority sort below, so scarce
         // licenses are reserved highest-priority-first and a single pass cannot
@@ -1473,7 +1477,7 @@ impl ClusterManager {
                     // Resv -> Lic (partition block is permanent, so first).
                     partition_block(job, &partitions)
                         .or_else(|| dependency_block(job))
-                        .or_else(|| qos_block_for(job, &jobs))
+                        .or_else(|| qos_block_for(job, &self.resolve_qos(job), &jobs))
                         .or_else(|| reservation_block(job, &reservations, now))
                         .or_else(|| license_block(job, &available))
                         .map(|reason| (job.job_id, reason))
@@ -1793,6 +1797,18 @@ impl ClusterManager {
 
     pub fn fairshare_cache(&self) -> &Arc<FairshareCache> {
         &self.fairshare_cache
+    }
+
+    pub fn qos_cache(&self) -> &Arc<QosCache> {
+        &self.qos_cache
+    }
+
+    /// Resolve a job's QoS from the cache; unknown/absent name → limitless default.
+    fn resolve_qos(&self, job: &Job) -> Qos {
+        match job.spec.qos.as_deref() {
+            Some(name) => self.qos_cache.get(name).unwrap_or_default(),
+            None => Qos::default(),
+        }
     }
 
     /// Persist a mutation via Raft consensus. The apply callback
@@ -2456,34 +2472,45 @@ fn license_block(job: &Job, pool: &HashMap<String, u64>) -> Option<spur_core::jo
     None
 }
 
-/// The specific `QOS*` limit a job trips, or `None` if within limits. QoS is not
-/// yet sourced from the accounting DB (a limitless default is used), so this is
-/// wired but inert until real QoS configs exist. Shared by `pending_jobs()` and
-/// `tag_blocked_pending_reasons()`.
-fn qos_block_for(job: &Job, jobs: &HashMap<JobId, Job>) -> Option<spur_core::job::PendingReason> {
-    // No QoS -> no QoS-based block.
-    job.spec.qos.as_ref()?;
+/// Shared by `pending_jobs()` and `tag_blocked_pending_reasons()` so the drop
+/// decision and displayed reason always agree. Caller resolves the `Qos`.
+fn qos_block_for(
+    job: &Job,
+    qos: &Qos,
+    jobs: &HashMap<JobId, Job>,
+) -> Option<spur_core::job::PendingReason> {
+    let qos_name = job.spec.qos.as_ref()?;
     let user = &job.spec.user;
     let running_count = jobs
         .values()
-        .filter(|j| j.state == JobState::Running && j.spec.user == *user)
+        .filter(|j| {
+            j.state == JobState::Running
+                && j.spec.user == *user
+                && j.spec.qos.as_deref() == Some(qos_name.as_str())
+        })
         .count() as u32;
     let submitted_count = jobs
         .values()
         .filter(|j| {
-            (j.state == JobState::Pending || j.state == JobState::Running) && j.spec.user == *user
+            (j.state == JobState::Pending || j.state == JobState::Running)
+                && j.spec.user == *user
+                && j.spec.qos.as_deref() == Some(qos_name.as_str())
         })
         .count() as u32;
-    let mut running_tres = TresRecord::new();
-    let running_cpus: u64 = jobs
-        .values()
-        .filter(|j| j.state == JobState::Running && j.spec.user == *user)
-        .map(|j| (j.spec.num_tasks * j.spec.cpus_per_task) as u64)
-        .sum();
-    running_tres.set(TresType::Cpu, running_cpus);
+    let user_running_tres = sum_running_tres(jobs, |j| {
+        j.spec.user == *user && j.spec.qos.as_deref() == Some(qos_name.as_str())
+    });
+    let qos_running_tres =
+        sum_running_tres(jobs, |j| j.spec.qos.as_deref() == Some(qos_name.as_str()));
 
-    let qos = Qos::default();
-    match check_qos_limits(job, &qos, running_count, submitted_count, &running_tres) {
+    match check_qos_limits(
+        job,
+        qos,
+        running_count,
+        submitted_count,
+        &user_running_tres,
+        &qos_running_tres,
+    ) {
         QosCheckResult::Allowed => None,
         QosCheckResult::Blocked(reason) => Some(reason),
     }
@@ -2518,6 +2545,25 @@ fn partition_block(job: &Job, partitions: &[Partition]) -> Option<spur_core::job
         }
     }
     None
+}
+
+fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> TresRecord {
+    let mut tres = TresRecord::new();
+    let (mut cpu, mut node, mut mem) = (0u64, 0u64, 0u64);
+    for j in jobs.values() {
+        if j.state != JobState::Running || !pred(j) {
+            continue;
+        }
+        cpu += (j.spec.num_tasks * j.spec.cpus_per_task) as u64;
+        node += j.spec.num_nodes as u64;
+        if let Some(m) = j.spec.memory_per_node_mb {
+            mem += m * j.spec.num_nodes as u64;
+        }
+    }
+    tres.set(TresType::Cpu, cpu);
+    tres.set(TresType::Node, node);
+    tres.set(TresType::Memory, mem);
+    tres
 }
 
 fn extract_license_requirements(spec: &JobSpec) -> HashMap<String, u64> {
@@ -4306,6 +4352,78 @@ mod tests {
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::Licenses
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_blocked_sets_qos_reason_from_cache() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        // Seed the cache with a QoS that caps wall time at 1 min, then submit a
+        // job to that QoS asking for more — the specific QOS reason must surface
+        // through resolve_qos -> qos_block_for (not the old limitless default).
+        cm.qos_cache().insert(Qos {
+            name: "short".into(),
+            limits: spur_core::accounting::QosLimits {
+                max_wall_minutes: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let mut spec = basic_spec("qos");
+        spec.qos = Some("short".into());
+        spec.time_limit = Some(chrono::Duration::hours(1));
+        let job_id = submit_and_wait(&cm, spec);
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::QosMaxWallDurationPerJobLimit
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_blocked_sets_qos_grp_cpu_reason() {
+        // GrpCPU aggregates across all running jobs in the QOS: a running 4-cpu
+        // job fills a grp_tres cpu=4 cap, so the next job in the same QOS blocks
+        // with QOSGrpCpuLimit (the group reason, not the per-job/per-user one).
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Cpu, 4);
+        cm.qos_cache().insert(Qos {
+            name: "grp".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut s1 = basic_spec("g1");
+        s1.qos = Some("grp".into());
+        s1.num_tasks = 4;
+        let j1 = submit_and_wait(&cm, s1);
+        let res = scalar_alloc(4, 1000);
+        cm.start_job(
+            j1,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, j1, JobState::Running);
+
+        let mut s2 = basic_spec("g2");
+        s2.qos = Some("grp".into());
+        s2.num_tasks = 1;
+        let j2 = submit_and_wait(&cm, s2);
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(j2).unwrap().pending_reason,
+            PendingReason::QosGrpCpuLimit
         );
     }
 

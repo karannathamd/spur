@@ -374,17 +374,40 @@ impl SlurmAccounting for AccountingService {
         let max_jobs = if req.max_jobs_per_user == 0 {
             None
         } else {
-            Some(req.max_jobs_per_user as i32)
+            Some(
+                i32::try_from(req.max_jobs_per_user)
+                    .map_err(|_| Status::invalid_argument("max_jobs_per_user exceeds i32::MAX"))?,
+            )
         };
         let max_wall = if req.max_wall_minutes == 0 {
             None
         } else {
-            Some(req.max_wall_minutes as i32)
+            Some(
+                i32::try_from(req.max_wall_minutes)
+                    .map_err(|_| Status::invalid_argument("max_wall_minutes exceeds i32::MAX"))?,
+            )
         };
         let max_tres = if req.max_tres_per_job.is_empty() {
             None
         } else {
             Some(req.max_tres_per_job.as_str())
+        };
+        let max_submit = if req.max_submit_jobs_per_user == 0 {
+            None
+        } else {
+            Some(i32::try_from(req.max_submit_jobs_per_user).map_err(|_| {
+                Status::invalid_argument("max_submit_jobs_per_user exceeds i32::MAX")
+            })?)
+        };
+        let max_tres_user = if req.max_tres_per_user.is_empty() {
+            None
+        } else {
+            Some(req.max_tres_per_user.as_str())
+        };
+        let grp_tres = if req.grp_tres.is_empty() {
+            None
+        } else {
+            Some(req.grp_tres.as_str())
         };
         db::upsert_qos(
             &self.pool,
@@ -396,6 +419,9 @@ impl SlurmAccounting for AccountingService {
             max_jobs,
             max_wall,
             max_tres,
+            max_submit,
+            max_tres_user,
+            grp_tres,
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -429,6 +455,9 @@ impl SlurmAccounting for AccountingService {
                 max_jobs_per_user: r.max_jobs_per_user.unwrap_or(0) as u32,
                 max_wall_minutes: r.max_wall_min.unwrap_or(0) as u32,
                 max_tres_per_job: r.max_tres_per_job.unwrap_or_default(),
+                max_submit_jobs_per_user: r.max_submit_per_user.unwrap_or(0) as u32,
+                max_tres_per_user: r.max_tres_per_user.unwrap_or_default(),
+                grp_tres: r.grp_tres.unwrap_or_default(),
             })
             .collect();
 
