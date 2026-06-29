@@ -213,6 +213,10 @@ jobs:
           sarif_file: trivy-nightly.sarif
           category: trivy-nightly
 
+      - name: Prepare security reports directory
+        if: always() && steps.scan.outcome != 'skipped'
+        run: mkdir -p security-reports
+
       - name: Scan image (JSON report for internal integrations)
         id: json-scan
         if: always() && steps.scan.outcome != 'skipped'
