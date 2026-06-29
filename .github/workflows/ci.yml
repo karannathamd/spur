@@ -265,6 +265,7 @@ jobs:
           format: json
           output: security-reports/spur-image-trivy-result.json
           exit-code: "0"
+          version: "v0.69.3"
 
       - name: Generate SBOM (SPDX)
         id: sbom
@@ -275,6 +276,7 @@ jobs:
           format: spdx-json
           output: security-reports/spur-image-sbom.spdx.json
           exit-code: "0"
+          version: "v0.69.3"
 
       - name: Generate scan-manifest.json
         if: always() && steps.json-scan.outcome == 'success'
