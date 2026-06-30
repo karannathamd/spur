@@ -25,6 +25,9 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     steps:
+      - name: Pin Werkzeug to fix flask 2.0 compatibility
+        run: pip3 install 'Werkzeug<3.0.0'
+
       - name: Sync code scanning alerts to Jira
         uses: github/ghas-jira-integration@v1
         with:
